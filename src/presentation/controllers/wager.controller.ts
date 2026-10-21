@@ -1,14 +1,14 @@
 import {
-  Controller,
-  Post,
-  Get,
-  Body,
-  Param,
-  Headers,
   BadRequestException,
+  Body,
+  Controller,
+  Get,
+  Headers,
+  Param,
+  Post,
 } from '@nestjs/common';
+
 import { FinanceService } from '../../application/services/finance.service';
-import { generateCanonicalPayloadHash } from '../../domain/utils/hash.util';
 
 @Controller('wagering')
 export class WagerController {
@@ -26,66 +26,81 @@ export class WagerController {
       roundId: string;
       gameId: string;
       kind: 'BET' | 'WIN' | 'LOSS' | 'REFUND' | 'ROLLBACK';
-      money?: { amount: string; currency: string };
+      money?: {
+        amount: string;
+        currency: string;
+      };
       amount?: string;
       currency?: string;
       originalTransactionId?: string;
     },
   ) {
-    if (!idempotencyKey) {
+    if (!idempotencyKey?.trim()) {
       throw new BadRequestException('Idempotency-Key header is required.');
     }
 
-    // Normaliza para suportar tanto { money: { amount, currency } } quanto { amount, currency } direto
-    const amount = dto.money?.amount ?? dto.amount;
-    const currency = dto.money?.currency ?? dto.currency;
-
-    if (!amount || !currency) {
+    if (!dto.providerId || !dto.externalTransactionId || !dto.walletId) {
       throw new BadRequestException(
-        'Amount and currency must be provided either directly or inside the money object.',
+        'providerId, externalTransactionId and walletId are required.',
       );
     }
 
-    const payloadHash = generateCanonicalPayloadHash(dto);
+    const amount = dto.money?.amount ?? dto.amount;
+    const currency = dto.money?.currency ?? dto.currency;
+
+    if (
+      amount === undefined ||
+      amount === null ||
+      amount.trim() === '' ||
+      !currency?.trim()
+    ) {
+      throw new BadRequestException('Amount and currency are required.');
+    }
+
+    if (!Number.isFinite(Number(amount)) || Number(amount) <= 0) {
+      throw new BadRequestException('Amount must be greater than zero.');
+    }
+
+    console.log('WAGER REQUEST:', {
+      idempotencyKey,
+      providerId: dto.providerId,
+      externalTransactionId: dto.externalTransactionId,
+      walletId: dto.walletId,
+      kind: dto.kind,
+      amount,
+      currency,
+    });
+
+    const transaction = {
+      providerId: dto.providerId,
+      externalTransactionId: dto.externalTransactionId,
+      walletId: dto.walletId,
+      amount,
+      currency: currency.toUpperCase(),
+      idempotencyKey, // <-- Passando a idempotencyKey corretamente
+    };
 
     switch (dto.kind) {
       case 'BET':
-        return await this.financeService.processBet({
-          providerId: dto.providerId,
-          externalTransactionId: dto.externalTransactionId,
-          walletId: dto.walletId,
-          amount,
-          currency,
-        });
+        return this.financeService.processBet(transaction);
 
       case 'WIN':
-        return await this.financeService.processWin({
-          providerId: dto.providerId,
-          externalTransactionId: dto.externalTransactionId,
-          walletId: dto.walletId,
-          amount,
-          currency,
-        });
+        return this.financeService.processWin(transaction);
 
       case 'LOSS':
-        return await this.financeService.processWin({
-          providerId: dto.providerId,
-          externalTransactionId: dto.externalTransactionId,
-          walletId: dto.walletId,
-          amount: '0.00',
-          currency,
-        });
+        throw new BadRequestException('LOSS processing is not implemented.');
 
       case 'ROLLBACK':
       case 'REFUND':
-        return await this.financeService.processRollback({
-          providerId: dto.providerId,
-          externalTransactionId: dto.externalTransactionId,
-          originalTransactionId:
-            dto.originalTransactionId || dto.externalTransactionId,
-          walletId: dto.walletId,
-          amount,
-          currency,
+        if (!dto.originalTransactionId) {
+          throw new BadRequestException(
+            'originalTransactionId is required for rollback/refund.',
+          );
+        }
+
+        return this.financeService.processRollback({
+          ...transaction,
+          originalTransactionId: dto.originalTransactionId,
         });
 
       default:
@@ -97,6 +112,9 @@ export class WagerController {
 
   @Get('transactions/:id')
   async getTransactionById(@Param('id') id: string) {
-    return { message: 'Transaction lookup endpoint ready', transactionId: id };
+    return {
+      message: 'Transaction lookup endpoint ready',
+      transactionId: id,
+    };
   }
 }

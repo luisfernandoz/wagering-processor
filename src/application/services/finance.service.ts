@@ -7,6 +7,7 @@ import { EntityManager } from '@mikro-orm/postgresql';
 import { WalletEntity } from '../../infrastructure/persistence/entities/wallet.entity';
 import { TransactionEntity } from '../../infrastructure/persistence/entities/transaction.entity';
 import { LedgerEntity } from '../../infrastructure/persistence/entities/ledger.entity';
+import { OutboxMessageEntity } from '../../infrastructure/persistence/entities/outbox-message.entity';
 import { Wallet } from '../../domain/models/wallet';
 import { Money } from '../../domain/models/money';
 import { WagerTransaction } from '../../domain/models/wager-transaction';
@@ -20,121 +21,171 @@ export class FinanceService {
     providerId: string;
     externalTransactionId: string;
     walletId: string;
-    amount: string;
-    currency: string;
+    amount?: string;
+    currency?: string;
+    money?: { amount: string; currency: string };
   }): Promise<void> {
-    const em = this.em.fork();
+    const amountStr = dto.amount || dto.money?.amount;
+    const currencyStr = dto.currency || dto.money?.currency;
 
-    await em.transactional(async (trxEm) => {
-      // 1. Verificar idempotência
-      const existingTx = await trxEm.findOne(TransactionEntity, {
-        providerId: dto.providerId,
-        externalTransactionId: dto.externalTransactionId,
+    if (!amountStr || !currencyStr) {
+      throw new BadRequestException('Amount and currency are required.');
+    }
+
+    try {
+      await this.em.transactional(async (trxEm) => {
+        const existingTx = await trxEm.findOne(TransactionEntity, {
+          providerId: dto.providerId,
+          externalTransactionId: dto.externalTransactionId,
+        });
+
+        if (existingTx) {
+          console.log(
+            '⚠️ [processBet] Transação já existe (Idempotência acionada):',
+            dto.externalTransactionId,
+          );
+          return;
+        }
+
+        const walletEntity = await trxEm.findOne(
+          WalletEntity,
+          { id: dto.walletId },
+          { lockMode: 4 as any },
+        );
+
+        if (!walletEntity) {
+          throw new NotFoundException('Wallet not found.');
+        }
+
+        if (walletEntity.currency !== currencyStr.toUpperCase()) {
+          throw new BadRequestException('Currency mismatch for wallet.');
+        }
+
+        const wallet = Wallet.reconstitute({
+          id: walletEntity.id,
+          userId: walletEntity.userId,
+          balance: Money.from({
+            amount: walletEntity.balance,
+            currency: walletEntity.currency,
+          }),
+          version: walletEntity.version,
+        });
+
+        const betAmount = Money.from({
+          amount: amountStr,
+          currency: currencyStr,
+        });
+
+        let ledgerEntry;
+        try {
+          ledgerEntry = wallet.debit(betAmount, dto.externalTransactionId);
+        } catch (err: any) {
+          if (err.message?.includes('Insufficient funds')) {
+            throw new BadRequestException('Insufficient funds.');
+          }
+          throw err;
+        }
+
+        const transaction = WagerTransaction.create({
+          id: ledgerEntry.transactionId,
+          providerId: dto.providerId,
+          externalTransactionId: dto.externalTransactionId,
+          walletId: wallet.id,
+          type: 'BET',
+          amount: betAmount,
+        });
+
+        const now = new Date();
+        const newBalance = ledgerEntry.balanceAfter.toString();
+        const newVersion = walletEntity.version + 1;
+
+        console.log(
+          '✅ [processBet] Executando nativeUpdate para saldo:',
+          newBalance,
+        );
+
+        await trxEm.nativeUpdate(
+          WalletEntity,
+          { id: walletEntity.id },
+          {
+            balance: newBalance,
+            version: newVersion,
+            updatedAt: now,
+          },
+        );
+
+        const txEntity = trxEm.create(TransactionEntity, {
+          id: transaction.id,
+          providerId: transaction.providerId,
+          externalTransactionId: transaction.externalTransactionId,
+          walletId: transaction.walletId,
+          type: transaction.type,
+          amount: transaction.amount.toString(),
+          status: transaction.status,
+          createdAt: now,
+          updatedAt: now,
+        });
+
+        const ledgerDbEntity = trxEm.create(LedgerEntity, {
+          id: ledgerEntry.id,
+          walletId: ledgerEntry.walletId,
+          transactionId: ledgerEntry.transactionId,
+          type: ledgerEntry.type,
+          amount: ledgerEntry.amount.toString(),
+          balanceBefore: ledgerEntry.balanceBefore.toString(),
+          balanceAfter: ledgerEntry.balanceAfter.toString(),
+          createdAt: now,
+        });
+
+        const outboxMessage = trxEm.create(OutboxMessageEntity, {
+          id: randomUUID(),
+          aggregateType: 'Wallet',
+          aggregateId: wallet.id,
+          eventType: 'WalletDebited',
+          payload: {
+            transactionId: transaction.id,
+            walletId: wallet.id,
+            amount: betAmount.toString(),
+            currency: currencyStr,
+          },
+          status: 'PENDING',
+          createdAt: now,
+        });
+
+        trxEm.persist([txEntity, ledgerDbEntity, outboxMessage]);
+        await trxEm.flush();
       });
-
-      if (existingTx) {
-        return; // Idempotente: requisição duplicada processada com sucesso sem duplicar débito
-      }
-
-      // 2. Buscar carteira com lock pessimista para concorrência segura
-      const walletEntity = await trxEm.findOne(
-        WalletEntity,
-        { id: dto.walletId },
-        { lockMode: 4 as any }, // Pessimistic write lock
-      );
-
-      if (!walletEntity) {
-        throw new NotFoundException('Wallet not found.');
-      }
-
-      if (walletEntity.currency !== dto.currency.toUpperCase()) {
-        throw new BadRequestException('Currency mismatch for wallet.');
-      }
-
-      // 3. Reconstituir domínio da carteira
-      const wallet = Wallet.reconstitute({
-        id: walletEntity.id,
-        userId: walletEntity.userId,
-        balance: Money.from({
-          amount: walletEntity.balance,
-          currency: walletEntity.currency,
-        }),
-        version: walletEntity.version,
-      });
-
-      const betAmount = Money.from({
-        amount: dto.amount,
-        currency: dto.currency,
-      });
-
-      // 4. Executar regra de domínio (gerando UUIDs seguros internamente)
-      const ledgerEntry = wallet.debit(betAmount, dto.externalTransactionId);
-
-      // 5. Criar transação de domínio
-      const transaction = WagerTransaction.create({
-        id: ledgerEntry.transactionId,
-        providerId: dto.providerId,
-        externalTransactionId: dto.externalTransactionId,
-        walletId: wallet.id,
-        type: 'BET',
-        amount: betAmount,
-      });
-
-      // 6. Atualizar entidade de persistência da carteira
-      walletEntity.balance = wallet.balance.toString();
-      walletEntity.version = wallet.version;
-
-      // 7. Persistir transação e ledger com datas válidas
-      const now = new Date();
-
-      const txEntity = trxEm.create(TransactionEntity, {
-        id: transaction.id,
-        providerId: transaction.providerId,
-        externalTransactionId: transaction.externalTransactionId,
-        walletId: transaction.walletId,
-        type: transaction.type,
-        amount: transaction.amount.toString(),
-        status: transaction.status,
-        createdAt: now,
-        updatedAt: now,
-      });
-
-      const ledgerDbEntity = trxEm.create(LedgerEntity, {
-        id: ledgerEntry.id,
-        walletId: ledgerEntry.walletId,
-        transactionId: ledgerEntry.transactionId,
-        type: ledgerEntry.type,
-        amount: ledgerEntry.amount.toString(),
-        balanceBefore: ledgerEntry.balanceBefore.toString(),
-        balanceAfter: ledgerEntry.balanceAfter.toString(),
-        createdAt: now,
-      });
-
-      trxEm.persist([walletEntity, txEntity, ledgerDbEntity]);
-    });
+    } catch (error) {
+      console.error('❌ ERRO CRÍTICO NA TRANSAÇÃO [processBet]:', error);
+      throw error;
+    }
   }
 
   async processWin(dto: {
     providerId: string;
     externalTransactionId: string;
     walletId: string;
-    amount: string;
-    currency: string;
+    amount?: string;
+    currency?: string;
+    money?: { amount: string; currency: string };
   }): Promise<void> {
-    const em = this.em.fork();
+    const amountStr = dto.amount || dto.money?.amount;
+    const currencyStr = dto.currency || dto.money?.currency;
 
-    await em.transactional(async (trxEm) => {
-      // 1. Verificar idempotência para evitar créditos duplicados
+    if (!amountStr || !currencyStr) {
+      throw new BadRequestException('Amount and currency are required.');
+    }
+
+    await this.em.transactional(async (trxEm) => {
       const existingTx = await trxEm.findOne(TransactionEntity, {
         providerId: dto.providerId,
         externalTransactionId: dto.externalTransactionId,
       });
 
       if (existingTx) {
-        return; // Idempotente: requisição já processada
+        return;
       }
 
-      // 2. Buscar carteira com lock pessimista para evitar concorrência no saldo
       const walletEntity = await trxEm.findOne(
         WalletEntity,
         { id: dto.walletId },
@@ -145,11 +196,10 @@ export class FinanceService {
         throw new NotFoundException('Wallet not found.');
       }
 
-      if (walletEntity.currency !== dto.currency.toUpperCase()) {
+      if (walletEntity.currency !== currencyStr.toUpperCase()) {
         throw new BadRequestException('Currency mismatch for wallet.');
       }
 
-      // 3. Reconstituir domínio
       const wallet = Wallet.reconstitute({
         id: walletEntity.id,
         userId: walletEntity.userId,
@@ -161,14 +211,12 @@ export class FinanceService {
       });
 
       const winAmount = Money.from({
-        amount: dto.amount,
-        currency: dto.currency,
+        amount: amountStr,
+        currency: currencyStr,
       });
 
-      // 4. Executar regra de domínio (crédito)
       const ledgerEntry = wallet.credit(winAmount, dto.externalTransactionId);
 
-      // 5. Criar transação de domínio
       const transaction = WagerTransaction.create({
         id: ledgerEntry.transactionId,
         providerId: dto.providerId,
@@ -178,12 +226,19 @@ export class FinanceService {
         amount: winAmount,
       });
 
-      // 6. Atualizar carteira
-      walletEntity.balance = wallet.balance.toString();
-      walletEntity.version = wallet.version;
-
-      // 7. Persistir com datas válidas
       const now = new Date();
+      const newBalance = ledgerEntry.balanceAfter.toString();
+      const newVersion = walletEntity.version + 1;
+
+      await trxEm.nativeUpdate(
+        WalletEntity,
+        { id: walletEntity.id },
+        {
+          balance: newBalance,
+          version: newVersion,
+          updatedAt: now,
+        },
+      );
 
       const txEntity = trxEm.create(TransactionEntity, {
         id: transaction.id,
@@ -208,7 +263,23 @@ export class FinanceService {
         createdAt: now,
       });
 
-      trxEm.persist([walletEntity, txEntity, ledgerDbEntity]);
+      const outboxMessage = trxEm.create(OutboxMessageEntity, {
+        id: randomUUID(),
+        aggregateType: 'Wallet',
+        aggregateId: wallet.id,
+        eventType: 'WalletCredited',
+        payload: {
+          transactionId: transaction.id,
+          walletId: wallet.id,
+          amount: winAmount.toString(),
+          currency: currencyStr,
+        },
+        status: 'PENDING',
+        createdAt: now,
+      });
+
+      trxEm.persist([txEntity, ledgerDbEntity, outboxMessage]);
+      await trxEm.flush();
     });
   }
 
@@ -217,23 +288,27 @@ export class FinanceService {
     externalTransactionId: string;
     originalTransactionId: string;
     walletId: string;
-    amount: string;
-    currency: string;
+    amount?: string;
+    currency?: string;
+    money?: { amount: string; currency: string };
   }): Promise<void> {
-    const em = this.em.fork();
+    const amountStr = dto.amount || dto.money?.amount;
+    const currencyStr = dto.currency || dto.money?.currency;
 
-    await em.transactional(async (trxEm) => {
-      // 1. Verificar idempotência para o estorno
+    if (!amountStr || !currencyStr) {
+      throw new BadRequestException('Amount and currency are required.');
+    }
+
+    await this.em.transactional(async (trxEm) => {
       const existingRollbackTx = await trxEm.findOne(TransactionEntity, {
         providerId: dto.providerId,
         externalTransactionId: dto.externalTransactionId,
       });
 
       if (existingRollbackTx) {
-        return; // Já estornado anteriormente
+        return;
       }
 
-      // 2. Buscar transação original para saber se foi BET ou WIN
       const originalTx = await trxEm.findOne(TransactionEntity, {
         providerId: dto.providerId,
         externalTransactionId: dto.originalTransactionId,
@@ -245,7 +320,6 @@ export class FinanceService {
         );
       }
 
-      // 3. Buscar carteira com lock pessimista
       const walletEntity = await trxEm.findOne(
         WalletEntity,
         { id: dto.walletId },
@@ -256,11 +330,10 @@ export class FinanceService {
         throw new NotFoundException('Wallet not found.');
       }
 
-      if (walletEntity.currency !== dto.currency.toUpperCase()) {
+      if (walletEntity.currency !== currencyStr.toUpperCase()) {
         throw new BadRequestException('Currency mismatch for wallet.');
       }
 
-      // 4. Reconstituir domínio
       const wallet = Wallet.reconstitute({
         id: walletEntity.id,
         userId: walletEntity.userId,
@@ -272,20 +345,17 @@ export class FinanceService {
       });
 
       const rollbackAmount = Money.from({
-        amount: dto.amount,
-        currency: dto.currency,
+        amount: amountStr,
+        currency: currencyStr,
       });
 
       const isCreditRollback = originalTx.type === 'WIN';
-
-      // 5. Executar regra de estorno no domínio
       const ledgerEntry = wallet.rollback(
         rollbackAmount,
         dto.externalTransactionId,
         isCreditRollback,
       );
 
-      // 6. Criar transação de domínio para o estorno
       const transaction = WagerTransaction.create({
         id: ledgerEntry.transactionId,
         providerId: dto.providerId,
@@ -295,12 +365,19 @@ export class FinanceService {
         amount: rollbackAmount,
       });
 
-      // 7. Atualizar carteira
-      walletEntity.balance = wallet.balance.toString();
-      walletEntity.version = wallet.version;
-
-      // 8. Persistir dados
       const now = new Date();
+      const newBalance = ledgerEntry.balanceAfter.toString();
+      const newVersion = walletEntity.version + 1;
+
+      await trxEm.nativeUpdate(
+        WalletEntity,
+        { id: walletEntity.id },
+        {
+          balance: newBalance,
+          version: newVersion,
+          updatedAt: now,
+        },
+      );
 
       const txEntity = trxEm.create(TransactionEntity, {
         id: transaction.id,
@@ -325,13 +402,31 @@ export class FinanceService {
         createdAt: now,
       });
 
-      trxEm.persist([walletEntity, txEntity, ledgerDbEntity]);
+      const outboxMessage = trxEm.create(OutboxMessageEntity, {
+        id: randomUUID(),
+        aggregateType: 'Wallet',
+        aggregateId: wallet.id,
+        eventType: 'WalletRolledBack',
+        payload: {
+          transactionId: transaction.id,
+          walletId: wallet.id,
+          amount: rollbackAmount.toString(),
+          currency: currencyStr,
+        },
+        status: 'PENDING',
+        createdAt: now,
+      });
+
+      trxEm.persist([txEntity, ledgerDbEntity, outboxMessage]);
+      await trxEm.flush();
     });
   }
 
   async getBalance(walletId: string) {
     const em = this.em.fork();
-    const walletEntity = await em.findOne(WalletEntity, { id: walletId });
+    const walletEntity = await em.findOne(WalletEntity, { id: walletId }, {
+      refresh: true,
+    } as any);
 
     if (!walletEntity) {
       throw new NotFoundException('Wallet not found.');
@@ -425,9 +520,7 @@ export class FinanceService {
     playerId: string;
     initialBalance: { amount: string; currency: string };
   }) {
-    const em = this.em.fork();
-
-    return await em.transactional(async (trxEm) => {
+    return await this.em.transactional(async (trxEm) => {
       const existing = await trxEm.findOne(WalletEntity, {
         userId: dto.playerId,
         currency: dto.initialBalance.currency.toUpperCase(),
@@ -447,10 +540,12 @@ export class FinanceService {
         userId: dto.playerId,
         currency: dto.initialBalance.currency.toUpperCase(),
         balance: initialMoney.toString(),
-        version: 1, // <--- Adicione esta linha obrigatória exigida pelo TypeScript
+        version: 1,
         createdAt: new Date(),
         updatedAt: new Date(),
       });
+
+      const now = new Date();
 
       if (!initialMoney.isZero()) {
         const txId = randomUUID();
@@ -462,8 +557,8 @@ export class FinanceService {
           type: 'OPENING',
           amount: initialMoney.toString(),
           status: 'PROCESSED',
-          createdAt: new Date(),
-          updatedAt: new Date(),
+          createdAt: now,
+          updatedAt: now,
         });
 
         const ledgerEntity = trxEm.create(LedgerEntity, {
@@ -474,13 +569,45 @@ export class FinanceService {
           amount: initialMoney.toString(),
           balanceBefore: '0.00',
           balanceAfter: initialMoney.toString(),
-          createdAt: new Date(),
+          createdAt: now,
         });
 
-        trxEm.persist([walletEntity, txEntity, ledgerEntity]);
+        const outboxMessage = trxEm.create(OutboxMessageEntity, {
+          id: randomUUID(),
+          aggregateType: 'Wallet',
+          aggregateId: walletId,
+          eventType: 'WalletCreated',
+          payload: {
+            walletId: walletId,
+            playerId: dto.playerId,
+            initialBalance: initialMoney.toString(),
+            currency: dto.initialBalance.currency.toUpperCase(),
+          },
+          status: 'PENDING',
+          createdAt: now,
+        });
+
+        trxEm.persist([walletEntity, txEntity, ledgerEntity, outboxMessage]);
       } else {
-        trxEm.persist(walletEntity);
+        const outboxMessage = trxEm.create(OutboxMessageEntity, {
+          id: randomUUID(),
+          aggregateType: 'Wallet',
+          aggregateId: walletId,
+          eventType: 'WalletCreated',
+          payload: {
+            walletId: walletId,
+            playerId: dto.playerId,
+            initialBalance: '0.00',
+            currency: dto.initialBalance.currency.toUpperCase(),
+          },
+          status: 'PENDING',
+          createdAt: now,
+        });
+
+        trxEm.persist([walletEntity, outboxMessage]);
       }
+
+      await trxEm.flush();
 
       return {
         id: walletEntity.id,

@@ -27,7 +27,7 @@ export class WalletEntity {
   updatedAt!: Date;
 
   @Property({ type: 'number', default: 1 })
-  version: number = 1;
+  version!: number;
 
   constructor(id: string, userId: string, balance: string, currency: string) {
     this.id = id;
