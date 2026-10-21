@@ -20,14 +20,14 @@ export class WalletEntity {
   @Property({ type: 'varchar', length: 3 })
   currency!: string;
 
-  @Property({ type: 'int', version: true })
-  version!: number;
-
   @Property({ type: 'timestamp', default: 'NOW()' })
   createdAt!: Date;
 
   @Property({ type: 'timestamp', default: 'NOW()' })
   updatedAt!: Date;
+
+  @Property({ type: 'number', default: 1 })
+  version: number = 1;
 
   constructor(id: string, userId: string, balance: string, currency: string) {
     this.id = id;

@@ -6,13 +6,14 @@ import { TransactionEntity } from './infrastructure/persistence/entities/transac
 import { LedgerEntity } from './infrastructure/persistence/entities/ledger.entity';
 import { FinanceService } from './application/services/finance.service';
 import { WagerController } from './presentation/controllers/wager.controller';
+import { WalletController } from './presentation/controllers/wallet.controller';
 
 @Module({
   imports: [
     MikroOrmModule.forRoot(mikroOrmConfig),
     MikroOrmModule.forFeature([WalletEntity, TransactionEntity, LedgerEntity]),
   ],
-  controllers: [WagerController],
+  controllers: [WagerController, WalletController],
   providers: [FinanceService],
 })
 export class AppModule {}
