@@ -79,7 +79,6 @@ describe('Wagering Processor E2E Tests', () => {
   });
 
   it('/wagering/transactions (POST) - should be idempotent on duplicate BET', async () => {
-    // Executa a mesma transação duplicada para garantir idempotência mantendo o saldo em 70.00
     const response = await request(app.getHttpServer())
       .post('/wagering/transactions')
       .set('idempotency-key', 'provider-test:bet-unique-01')

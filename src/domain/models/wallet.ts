@@ -45,8 +45,8 @@ export class Wallet {
     this._balance = this._balance.subtract(amount);
     const balanceAfter = this._balance;
 
-    const transactionId = randomUUID(); // Garante UUID válido para a transação
-    const ledgerId = randomUUID(); // Garante UUID válido para o ledger
+    const transactionId = randomUUID();
+    const ledgerId = randomUUID();
 
     return {
       id: ledgerId,
@@ -74,7 +74,7 @@ export class Wallet {
       id: ledgerId,
       walletId: this.id,
       transactionId,
-      type: 'WIN', // Tipo da operação de vitória/payout
+      type: 'WIN',
       amount,
       balanceBefore,
       balanceAfter,
@@ -92,13 +92,11 @@ export class Wallet {
     const balanceBefore = this._balance;
 
     if (isCreditRollback) {
-      // Se estamos estornando um WIN (crédito), precisamos retirar o dinheiro da carteira
       if (this._balance.isLessThan(amount)) {
         throw new Error('Insufficient funds to rollback credit.');
       }
       this._balance = this._balance.subtract(amount);
     } else {
-      // Se estamos estornando um BET (débito), devolvemos o dinheiro para a carteira
       this._balance = this._balance.add(amount);
     }
 
@@ -117,8 +115,6 @@ export class Wallet {
     };
   }
   loss(amount: Money): LedgerEntryProps | null {
-    // Loss não altera o saldo, mas pode retornar metadados se necessário
-    // Conforme a spec, LOSS não gera lançamento no ledger, apenas registra a transação.
     return null;
   }
 }

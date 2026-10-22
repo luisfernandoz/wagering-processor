@@ -11,16 +11,16 @@ export class OutboxMessageEntity {
   id!: string;
 
   @Property({ type: 'string' })
-  aggregateType!: string; // Ex: 'Wallet'
+  aggregateType!: string;
 
   @Property({ type: 'uuid' })
-  aggregateId!: string; // Ex: walletId
+  aggregateId!: string;
 
   @Property({ type: 'string' })
-  eventType!: string; // Ex: 'WalletDebited' ou 'WalletCredited'
+  eventType!: string;
 
   @Property({ type: 'json' })
-  payload!: any; // Dados do evento
+  payload!: any;
 
   @Property({ type: 'string', default: 'PENDING' })
   status: 'PENDING' | 'PROCESSED' | 'FAILED' = 'PENDING';

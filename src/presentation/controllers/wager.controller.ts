@@ -77,7 +77,7 @@ export class WagerController {
       walletId: dto.walletId,
       amount,
       currency: currency.toUpperCase(),
-      idempotencyKey, // <-- Passando a idempotencyKey corretamente
+      idempotencyKey,
     };
 
     switch (dto.kind) {
